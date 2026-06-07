@@ -3,9 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from .database import Base, engine
 from .models.player import Player
 from .models.user import User
+from .models.draftplayers import DraftPlayer
 from contextlib import asynccontextmanager
 from .routes import playersroute
 from .routes import usersroute
+
+
 
 
 @asynccontextmanager
