@@ -1,14 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .database import Base, engine
-from .models.player import Player
+from .models.team import Team
 from .models.user import User
-from .models.draftplayers import DraftPlayer
+from .models.draftteam import DraftTeam
 from contextlib import asynccontextmanager
-from .routes import playersroute
+from .routes import teamsroute
 from .routes import usersroute
-
-
 
 
 @asynccontextmanager
@@ -20,7 +18,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
 # Middleware sits between the browser and your routes
 # It intercepts every request before it hits your code
 # CORSMiddleware specifically handles the browser's cross-origin security check
@@ -31,8 +28,7 @@ app.add_middleware(
     allow_headers=["*"],   # allow all headers in the request
 )
 
-# Register the players& users routers — all routes defined in playersroute.py and usersroute.py are now active
-app.include_router(playersroute.router)
+app.include_router(teamsroute.router)
 app.include_router(usersroute.router)
 
 @app.get("/health")
