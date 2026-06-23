@@ -988,3 +988,231 @@ These are the natural next steps after building this project:
 | HTTPS / TLS | Encrypts traffic between browser and server | Railway and Vercel handle this for you automatically |
 | Rate limiting | Reject too-many requests from one IP | Prevents abuse of your API |
 | Indexes explained | How `index=True` speeds up queries | B-trees, query planning, when to add/avoid indexes |
+
+---
+
+## 18. Failures and what we learned from each
+
+Real development is mostly debugging. Every error below is something we actually hit.
+Reading this section is more valuable than reading polished tutorials, because tutorials
+skip the parts where things go wrong.
+
+---
+
+### FAIL 1 — Running `main.py` directly instead of with uvicorn
+
+**Error:**
+```
+ImportError: attempted relative import with no known parent package
+```
+
+**What happened:** We ran `python app/main.py` from inside the `backend/` directory.
+Python treated the file as a standalone script, so `from .database import Base` failed —
+relative imports only work when Python knows the file belongs to a package.
+
+**Fix:** Always start a FastAPI app with uvicorn, never with `python`:
+```bash
+uvicorn app.main:app --reload
+```
+The dot-notation (`app.main:app`) is what gives Python the package context it needs.
+
+**Lesson:** FastAPI files are package modules, not standalone scripts. The `--reload`
+flag restarts the server every time you save a file, so you never need to restart manually
+during development.
+
+---
+
+### FAIL 2 — Test data accumulating across runs
+
+**What happened:** The test script created a team, user, and picks. On the second run
+it crashed with a duplicate-key error because those rows already existed from the first run.
+
+**Fix:** Add a cleanup block at the very start of every test:
+```python
+db.query(DraftTeam).filter(DraftTeam.room_code == "TEST").delete()
+db.query(User).filter(User.name == "testuser").delete()
+db.query(Team).filter(Team.name == "Test FC").delete()
+db.commit()
+```
+
+**Lesson:** Tests must leave the database in a clean state (or start by cleaning it).
+This principle is called *test isolation*. Professional test suites use database
+transactions that roll back after each test, or a separate test database that gets
+wiped on every run. If you skip isolation, tests become order-dependent and flaky.
+
+---
+
+### FAIL 3 — Foreign key constraint violation in `/draft-teams`
+
+**Error:**
+```
+sqlalchemy.exc.IntegrityError: insert or update on table "draft_teams"
+violates foreign key constraint "draft_teams_user_id_fkey"
+```
+
+**What happened:** We POSTed `user_id=9999` to `/draft-teams`. The `draft_teams` table
+requires `user_id` to reference a real row in the `user` table. There was no user 9999.
+
+**Fix:** Create the prerequisite row in the test setup first, then use the returned ID:
+```python
+user = User(name="testuser", room_code="TEST")
+db.add(user); db.commit()
+# Now use user.id instead of 9999
+```
+
+**Lesson:** Foreign key constraints are the database enforcing that your data makes sense.
+A pick that references a nonexistent user is corrupt data. The constraint prevents it.
+When a test hits a FK error, it means the setup is missing a prerequisite insert.
+
+---
+
+### FAIL 4 — PowerShell mangling Python f-strings
+
+**What happened:** Running a Python one-liner with `-c` in PowerShell caused syntax errors
+because PowerShell expands `$` and `{}` inside strings before Python ever sees them.
+
+**Fix:** Put any Python with f-strings or curly braces into a `.py` file and run that:
+```bash
+python test_scoring.py   # always works
+python -c "print(f'{x}')"  # PowerShell breaks this
+```
+
+**Lesson:** Every shell (bash, PowerShell, cmd.exe) has its own string-escaping rules.
+When a script has more than a trivial one-liner, put it in a file. Files are portable;
+shell quoting rules are a maintenance nightmare.
+
+---
+
+### FAIL 5 — Playwright `networkidle` timeout
+
+**Error:**
+```
+TimeoutError: waiting for networkidle
+```
+
+**What happened:** We told Playwright to wait until the FIFA standings page had no network
+activity for 500ms. But FIFA's page runs background analytics and websockets indefinitely,
+so it never goes idle.
+
+**Fix:** Don't wait for `networkidle`. Accept the timeout and move on — by the time it fires,
+all the API calls we needed have already been captured:
+```python
+try:
+    page.wait_for_load_state("networkidle", timeout=5000)
+except:
+    pass  # fine — we already intercepted the requests we needed
+```
+
+**Lesson:** `networkidle` is an unreliable signal on modern websites that run tracking and
+telemetry in the background. Wait for a specific element or a specific network request
+instead of waiting for all activity to stop.
+
+---
+
+### FAIL 6 — FIFA team names not matching our database
+
+**What happened:** After writing the sync endpoint, 4 of 48 teams were skipped because
+their names didn't match: FIFA uses "Korea Republic", "USA", "IR Iran" — we stored
+"South Korea", "United States", "Iran".
+
+**Fix — two layers:**
+
+1. **Normalize both sides** before comparing: strip accents, lowercase, remove punctuation.
+   "Côte d'Ivoire" and "Cote dIvoire" both become `"cotedivoire"`.
+
+2. **Manual override dictionary** for names normalization alone can't fix:
+```python
+FIFA_NAME_OVERRIDES = {
+    "usa":           "United States",
+    "korearepublic": "South Korea",
+    "iiran":         "Iran",
+}
+```
+
+**Lesson:** Any time you match strings from two different data sources, assume they won't
+match exactly. Build a normalization layer plus an override map from the start. This
+pattern (normalize → override → match) is standard in data pipelines.
+
+---
+
+### FAIL 7 — Accidentally deploying Python code to the Postgres container
+
+**What happened:** When we first ran `railway up --detach`, Railway's CLI was linked to
+the Postgres service (the only service in the project). It uploaded our Python backend
+code onto the Postgres container. Postgres crashed because it expected to run a database
+image, not a Python app.
+
+**Fix:**
+1. Disconnect our Python source from the Postgres service:
+   `railway service source disconnect --service Postgres`
+2. Redeploy Postgres from its original image:
+   `railway service redeploy --service Postgres --yes`
+3. Wait for Postgres to come back online, then restart the backend.
+
+**Lesson:** Always run `railway service list` before `railway up` to confirm which service
+is linked (`"isLinked": true`). Infrastructure mistakes like this are fully recoverable
+but cost time. Check before you deploy.
+
+---
+
+### FAIL 8 — Backend stuck at "Waiting for application startup" (502 errors)
+
+**What happened:** After the Postgres crash, Railway reported the build as `SUCCESS` and
+showed one replica running, but every HTTP request returned 502. The logs showed:
+```
+INFO: Started server process [1]
+INFO: Waiting for application startup.
+```
+…and nothing after that. The app was alive but never finished starting.
+
+**Why:** The `lifespan` startup function calls `Base.metadata.create_all(bind=engine)`,
+which opens a database connection. The database was still down. Python was hanging
+waiting for a connection that never came. The server never finished starting up, so
+every incoming request got a 502 gateway error.
+
+**Fix:** Restore Postgres first (FAIL 7 above), then restart the backend service so
+it can complete its startup sequence.
+
+**Lesson:** If your app connects to a database at startup and the database is unavailable,
+the entire app hangs. This is a common production failure mode. Real systems add:
+- Retry logic with exponential backoff in the startup sequence
+- A health check endpoint Railway can use to detect the failed start
+- Lazy connections (open the connection on first query, not at startup)
+
+---
+
+### FAIL 9 — Internal Railway hostname not resolving after service restart
+
+**What happened:** Even after Postgres was restored, the backend still returned 502.
+We had set `DATABASE_URL` to `postgres.railway.internal:5432` — Railway's private
+network address. After the crash-and-restore cycle, that hostname wasn't resolving
+correctly.
+
+**Fix:** Switch to the public proxy URL:
+```
+DATABASE_URL=postgresql://postgres:PASSWORD@reseau.proxy.rlwy.net:43664/railway
+```
+
+**Lesson:** Private hostnames (`.railway.internal`) are faster and more secure for
+service-to-service communication, but they're more fragile during infrastructure changes.
+When debugging connection issues, switch to the public URL first to isolate whether the
+problem is the internal DNS or something else. Once things are stable, you can switch
+back to the internal URL for lower latency.
+
+---
+
+### General debugging checklist
+
+When something is broken and you don't know where to start:
+
+| Step | What to do | What it tells you |
+|------|-----------|-------------------|
+| 1 | Open browser DevTools → Network tab | What request was sent, what status code came back, what the response body says |
+| 2 | `curl http://localhost:8000/the-endpoint` | Is the backend returning the right data independent of the frontend? |
+| 3 | Check the uvicorn terminal | Full Python stack trace for any 500 errors |
+| 4 | `railway logs --tail 50` | Is the deployed app crashing at startup or during requests? |
+| 5 | Check env vars: `railway variables` / `vercel env ls` | Is the production app missing a secret that works locally? |
+| 6 | Query the database directly | Is the data you expect actually in there? |
+
+Work through the layers: browser → frontend code → network request → backend code → database.
+The bug is in exactly one of those layers. Isolate which one before writing any fix.
