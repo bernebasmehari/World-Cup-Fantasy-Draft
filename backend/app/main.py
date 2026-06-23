@@ -4,9 +4,12 @@ from .database import Base, engine
 from .models.team import Team
 from .models.user import User
 from .models.draftteam import DraftTeam
+from .models.account import Account
 from contextlib import asynccontextmanager
 from .routes import teamsroute
 from .routes import usersroute
+from .routes import authroute
+from .routes import syncroute
 
 
 @asynccontextmanager
@@ -21,15 +24,19 @@ app = FastAPI(lifespan=lifespan)
 # Middleware sits between the browser and your routes
 # It intercepts every request before it hits your code
 # CORSMiddleware specifically handles the browser's cross-origin security check
+import os
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # only allow requests from your React app
-    allow_methods=["*"],   # allow all HTTP methods (GET, POST, PUT, DELETE...)
-    allow_headers=["*"],   # allow all headers in the request
+    allow_origins=[FRONTEND_URL, "http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+app.include_router(authroute.router)
 app.include_router(teamsroute.router)
 app.include_router(usersroute.router)
+app.include_router(syncroute.router)
 
 @app.get("/health")
 def health_check():
